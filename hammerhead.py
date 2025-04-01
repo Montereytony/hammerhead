@@ -1,24 +1,45 @@
 #!/usr/bin/env python3
-# Testing the hammerhead maneuver in a SITL simulation
-# This script uses DroneKit with SITL for simulation testing
+# Fixed hammerhead maneuver simulation for Python 3.12
+# Using direct pymavlink instead of dronekit
 
 import time
 from datetime import datetime
 import math
-import dronekit_sitl
-from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
 import numpy as np
 import matplotlib.pyplot as plt
 from pymavlink import mavutil
+import subprocess
+import threading
+import os
+import signal
 
-# Start SITL simulation
-print("Starting SITL simulation...")
-sitl = dronekit_sitl.start_default(lat=37.7749, lon=-122.4194)  # San Francisco coordinates
-connection_string = sitl.connection_string()
+# Global variable to track if the simulation is running
+simulation_running = True
 
-# Connect to the Vehicle
-print(f"Connecting to vehicle on: {connection_string}")
-vehicle = connect(connection_string, wait_ready=True)
+def start_sitl():
+    """Start the SITL simulator using subprocess"""
+    print("Starting SITL simulation...")
+    # Start ArduCopter SITL
+    sitl_process = subprocess.Popen(
+        ['ardupilot_sitl', 'copter', '--model', 'quad', '--home=37.7749,-122.4194,0,180'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+    return sitl_process
+
+def connect_to_vehicle():
+    """Connect to the vehicle using pymavlink"""
+    print("Connecting to vehicle...")
+    # Connect to the Vehicle through UDP
+    connection_string = 'udp:127.0.0.1:14550'
+    vehicle = mavutil.mavlink_connection(connection_string)
+    
+    # Wait for the first heartbeat to confirm connection
+    print("Waiting for heartbeat...")
+    vehicle.wait_heartbeat()
+    print("Connected to vehicle!")
+    
+    return vehicle
 
 # Data collection for visualization
 trajectory = {
@@ -32,71 +53,130 @@ trajectory = {
     'throttle': []
 }
 
-def record_data():
+def record_data(vehicle):
     """Record current vehicle state for later analysis"""
-    now = time.time()
-    trajectory['time'].append(now)
-    trajectory['altitude'].append(vehicle.location.global_relative_frame.alt)
-    trajectory['pitch'].append(vehicle.attitude.pitch)
-    trajectory['roll'].append(vehicle.attitude.roll)
-    trajectory['yaw'].append(vehicle.attitude.yaw)
-    trajectory['north'].append(vehicle.location.local_frame.north)
-    trajectory['east'].append(vehicle.location.local_frame.east)
+    # Request current data
+    vehicle.mav.request_data_stream_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1
+    )
     
-    # Get current throttle from RC channel 3
-    trajectory['throttle'].append(vehicle.channels['3'])
+    # Get position and attitude
+    pos_msg = vehicle.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+    att_msg = vehicle.recv_match(type='ATTITUDE', blocking=True, timeout=1)
+    rc_msg = vehicle.recv_match(type='RC_CHANNELS', blocking=True, timeout=1)
+    
+    now = time.time()
+    if pos_msg and att_msg and rc_msg:
+        # Position data
+        alt = pos_msg.relative_alt / 1000.0  # Convert mm to m
+        
+        # Attitude data
+        pitch = att_msg.pitch
+        roll = att_msg.roll
+        yaw = att_msg.yaw
+        
+        # Location data
+        # We'll use a local coordinate system with the starting point as origin
+        if len(trajectory['north']) == 0:
+            trajectory['north'].append(0)
+            trajectory['east'].append(0)
+        else:
+            # We'd normally calculate this from lat/lon, 
+            # but for simplicity in simulation, we'll use a simple model
+            dt = now - trajectory['time'][-1]
+            forward_speed = 5  # Estimated speed in m/s
+            
+            # Rough approximation of movement based on attitude
+            north_change = math.cos(yaw) * forward_speed * dt * math.cos(pitch)
+            east_change = math.sin(yaw) * forward_speed * dt * math.cos(pitch)
+            
+            trajectory['north'].append(trajectory['north'][-1] + north_change)
+            trajectory['east'].append(trajectory['east'][-1] + east_change)
+        
+        # RC data
+        throttle = (rc_msg.chan3_raw - 1000) / 1000.0  # Scale to 0-1
+        
+        trajectory['time'].append(now)
+        trajectory['altitude'].append(alt)
+        trajectory['pitch'].append(pitch)
+        trajectory['roll'].append(roll)
+        trajectory['yaw'].append(yaw)
+        trajectory['throttle'].append(throttle)
 
-def arm_and_takeoff(target_altitude):
+def arm_and_takeoff(vehicle, target_altitude):
     """Arm the vehicle and fly to target_altitude"""
     print("Basic pre-arm checks")
-    while not vehicle.is_armable:
-        print("Waiting for vehicle to initialize...")
-        time.sleep(1)
-        
-    print("Arming motors")
-    vehicle.mode = VehicleMode("GUIDED")
-    vehicle.armed = True
     
-    while not vehicle.armed:
-        print("Waiting for arming...")
-        time.sleep(1)
-        
+    # Set mode to GUIDED
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
+    
+    # Arm the vehicle
+    print("Arming motors")
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+        1, 0, 0, 0, 0, 0, 0)
+    
+    # Wait for arming
+    armed = False
+    while not armed:
+        msg = vehicle.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+        if msg:
+            armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            if armed:
+                print("Vehicle armed!")
+        time.sleep(0.1)
+    
+    # Command takeoff
     print("Taking off!")
-    vehicle.simple_takeoff(target_altitude)
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+        0, 0, 0, 0, 0, 0, target_altitude)
     
     # Wait until the vehicle reaches a safe height
-    while True:
-        record_data()
-        current_altitude = vehicle.location.global_relative_frame.alt
-        print(f"Altitude: {current_altitude}")
-        if current_altitude >= target_altitude * 0.95:
-            print("Reached target altitude")
-            break
+    reached_altitude = False
+    while not reached_altitude and simulation_running:
+        record_data(vehicle)
+        if len(trajectory['altitude']) > 0:
+            current_altitude = trajectory['altitude'][-1]
+            print(f"Altitude: {current_altitude}")
+            if current_altitude >= target_altitude * 0.95:
+                print("Reached target altitude")
+                reached_altitude = True
         time.sleep(1)
 
-def send_attitude_target(roll_angle=0.0, pitch_angle=0.0,
+def send_attitude_target(vehicle, roll_angle=0.0, pitch_angle=0.0,
                          yaw_angle=None, yaw_rate=0.0, use_yaw_rate=False,
                          thrust=0.5):
     """
     Control vehicle attitude.
     """
+    # Use current yaw if not specified
     if yaw_angle is None:
-        # Use current yaw if not specified
-        yaw_angle = vehicle.attitude.yaw
+        if len(trajectory['yaw']) > 0:
+            yaw_angle = trajectory['yaw'][-1]
+        else:
+            yaw_angle = 0
+    
+    # Convert Euler angles to quaternion
+    q = to_quaternion(roll_angle, pitch_angle, yaw_angle)
     
     # Thrust is from 0 to 1
-    msg = vehicle.message_factory.set_attitude_target_encode(
+    vehicle.mav.set_attitude_target_send(
         0,                                  # Timestamp (ms since boot, not used)
-        0, 0,                               # Target system, target component
+        vehicle.target_system,              # Target system
+        vehicle.target_component,           # Target component
         0b00000000 if use_yaw_rate else 0b00000100,  # Use yaw rate flag
-        # Quaternion representation of attitude
-        # We'll convert Euler angles to quaternions here
-        to_quaternion(roll_angle, pitch_angle, yaw_angle),
+        q,                                  # Quaternion
         0, 0, yaw_rate,                     # Roll, pitch, yaw rates (rad/s)
         thrust                              # Thrust (0-1)
     )
-    vehicle.send_mavlink(msg)
-    record_data()
+    record_data(vehicle)
 
 def to_quaternion(roll=0.0, pitch=0.0, yaw=0.0):
     """
@@ -116,25 +196,22 @@ def to_quaternion(roll=0.0, pitch=0.0, yaw=0.0):
     
     return [w, x, y, z]
 
-def execute_hammerhead_turn():
+def execute_hammerhead_turn(vehicle):
     """Execute a hammerhead 180° turn maneuver"""
     print("Starting hammerhead 180° turn...")
     
-    # Save the starting position
-    start_location = vehicle.location.global_relative_frame
-    
-    # Step 1: Set mode to GUIDED_NOGPS for direct attitude control
-    # Note: In SITL, we'll simulate this using regular GUIDED with attitude control
-    print("Setting up for direct attitude control...")
-    
     # Set initial attitude reference
-    initial_yaw = vehicle.attitude.yaw
+    if len(trajectory['yaw']) > 0:
+        initial_yaw = trajectory['yaw'][-1]
+    else:
+        initial_yaw = 0
     
     # Step 2: Initial vertical climb with high pitch and full throttle
     print("Initiating vertical climb...")
-    for i in range(20):  # Run for 2 seconds (20 * 0.1)
+    for i in range(20) and simulation_running:  # Run for 2 seconds (20 * 0.1)
         # Set attitude for vertical climb (pitch up 75 degrees)
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=math.radians(-75),  # Negative is pitch up in NED frame
             yaw_angle=initial_yaw,
@@ -144,8 +221,9 @@ def execute_hammerhead_turn():
     
     # Keep climbing for a few seconds
     print("Continuing vertical climb...")
-    for i in range(40):  # Run for 4 seconds
+    for i in range(40) and simulation_running:  # Run for 4 seconds
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=math.radians(-80),  # More vertical
             yaw_angle=initial_yaw,
@@ -155,8 +233,9 @@ def execute_hammerhead_turn():
     
     # Step 3: Cut throttle to initiate stall at top of maneuver
     print("Cutting throttle for stall...")
-    for i in range(20):  # Run for 2 seconds
+    for i in range(20) and simulation_running:  # Run for 2 seconds
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=math.radians(-85),  # Almost vertical
             yaw_angle=initial_yaw,
@@ -170,7 +249,7 @@ def execute_hammerhead_turn():
     if target_yaw > math.pi:
         target_yaw -= 2 * math.pi  # Keep in range -pi to pi
         
-    for i in range(30):  # Run for 3 seconds
+    for i in range(30) and simulation_running:  # Run for 3 seconds
         # Calculate intermediate yaw for smooth rotation
         progress = i / 30.0
         current_yaw = initial_yaw + progress * math.pi
@@ -178,6 +257,7 @@ def execute_hammerhead_turn():
             current_yaw -= 2 * math.pi
             
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=math.radians(-60),  # Start transitioning nose down
             yaw_angle=current_yaw,  # Apply rotation
@@ -187,12 +267,13 @@ def execute_hammerhead_turn():
     
     # Step 5: Transition to nose down for descent
     print("Transitioning to descent...")
-    for i in range(20):  # Run for 2 seconds
+    for i in range(20) and simulation_running:  # Run for 2 seconds
         progress = i / 20.0
         # Transition from -60 to 60 degrees (nose down)
         current_pitch = math.radians(-60 + progress * 120)
         
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=current_pitch,  # Transition to nose down
             yaw_angle=target_yaw,  # Maintain new heading
@@ -202,8 +283,9 @@ def execute_hammerhead_turn():
     
     # Step 6: Controlled descent in opposite direction
     print("Controlled descent...")
-    for i in range(30):  # Run for 3 seconds
+    for i in range(30) and simulation_running:  # Run for 3 seconds
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=math.radians(45),  # Nose down for descent
             yaw_angle=target_yaw,
@@ -213,12 +295,13 @@ def execute_hammerhead_turn():
     
     # Step 7: Level out
     print("Leveling out...")
-    for i in range(20):  # Run for 2 seconds
+    for i in range(20) and simulation_running:  # Run for 2 seconds
         progress = i / 20.0
         # Transition from 45 to 0 degrees (level)
         current_pitch = math.radians(45 - progress * 45)
         
         send_attitude_target(
+            vehicle,
             roll_angle=0,
             pitch_angle=current_pitch,
             yaw_angle=target_yaw,
@@ -228,52 +311,27 @@ def execute_hammerhead_turn():
     
     # Return to standard GUIDED mode control
     print("Returning to position hold...")
-    vehicle.mode = VehicleMode("GUIDED")
-    
-    # Go to a point 50m ahead in our new direction
-    current_location = vehicle.location.global_relative_frame
-    heading = math.degrees(target_yaw)
-    if heading < 0:
-        heading += 360
-        
-    # Calculate new position 50m ahead
-    north = math.cos(math.radians(heading)) * 50
-    east = math.sin(math.radians(heading)) * 50
-    
-    # Create a LocationGlobal object for the destination
-    destination = get_location_metres(current_location, north, east)
-    
-    # Command the vehicle to the destination
-    vehicle.simple_goto(destination)
-    
-    # Wait until we reach the destination
-    print("Flying to new position...")
-    for i in range(30):  # Wait up to 30 seconds
-        record_data()
-        time.sleep(1)
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 0, 0, 0, 0, 0)
     
     print("Hammerhead 180° turn completed!")
 
-def get_location_metres(original_location, dNorth, dEast):
-    """
-    Returns a LocationGlobal object containing the latitude/longitude
-    coordinates of a position that is 'dNorth' and 'dEast' metres from the 
-    specified 'original_location'.
-    """
-    earth_radius = 6378137.0  # Radius of "spherical" earth
-    
-    # Coordinate offsets in radians
-    dLat = dNorth / earth_radius
-    dLon = dEast / (earth_radius * math.cos(math.pi * original_location.lat / 180))
-    
-    # New position in decimal degrees
-    newlat = original_location.lat + (dLat * 180 / math.pi)
-    newlon = original_location.lon + (dLon * 180 / math.pi)
-    
-    return LocationGlobal(newlat, newlon, original_location.alt)
+def return_to_launch(vehicle):
+    """Command the vehicle to return to launch"""
+    print("Returning to launch...")
+    vehicle.mav.command_long_send(
+        vehicle.target_system, vehicle.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0,
+        0, 0, 0, 0, 0, 0, 0)
 
 def visualize_flight_data():
     """Create visualization of flight data"""
+    if len(trajectory['time']) < 2:
+        print("Not enough flight data collected for visualization")
+        return
+        
     # Convert time to relative seconds
     start_time = trajectory['time'][0]
     rel_time = [t - start_time for t in trajectory['time']]
@@ -321,53 +379,97 @@ def visualize_flight_data():
     plt.savefig(filename)
     print(f"Flight data visualization saved as {filename}")
     
-    plt.close(fig)
+    # Show the plot
+    plt.show()
+
+def keyboard_interrupt_handler():
+    """Listen for keyboard interrupt to stop the simulation gracefully"""
+    global simulation_running
+    try:
+        # Wait for keyboard interrupt
+        input("Press Enter to stop the simulation...\n")
+    except KeyboardInterrupt:
+        pass
+    
+    simulation_running = False
+    print("\nStopping simulation...")
 
 # MAIN EXECUTION
-try:
-    # Take off to sufficient altitude for maneuver
-    arm_and_takeoff(40)  # 40 meters for safety
+if __name__ == "__main__":
+    sitl_process = None
     
-    # Wait for a moment to stabilize
-    print("Stabilizing at altitude...")
-    for i in range(10):
-        record_data()
-        time.sleep(1)
-    
-    # Execute the hammerhead 180° turn
-    execute_hammerhead_turn()
-    
-    # Hover for a moment to collect more data
-    print("Collecting final data...")
-    for i in range(10):
-        record_data()
-        time.sleep(1)
-    
-    # Land
-    print("Returning to launch...")
-    vehicle.mode = VehicleMode("RTL")
-    
-    # Wait for landing
-    print("Waiting for landing...")
-    for i in range(60):  # Wait up to 60 seconds
-        record_data()
-        current_altitude = vehicle.location.global_relative_frame.alt
-        print(f"Altitude: {current_altitude}")
-        if current_altitude < 0.5:
-            print("Landed!")
-            break
-        time.sleep(1)
-    
-    # Create visualization
-    visualize_flight_data()
-    
-    print("Simulation complete!")
+    try:
+        # Start the keyboard interrupt handler in a separate thread
+        interrupt_thread = threading.Thread(target=keyboard_interrupt_handler)
+        interrupt_thread.daemon = True
+        interrupt_thread.start()
+        
+        # Start SITL and connect
+        sitl_process = start_sitl()
+        time.sleep(5)  # Give SITL time to initialize
+        vehicle = connect_to_vehicle()
+        
+        # Take off to sufficient altitude for maneuver
+        arm_and_takeoff(vehicle, 40)  # 40 meters for safety
+        
+        # Wait for a moment to stabilize
+        print("Stabilizing at altitude...")
+        for i in range(10):
+            if not simulation_running:
+                break
+            record_data(vehicle)
+            time.sleep(1)
+        
+        # Execute the hammerhead 180° turn
+        if simulation_running:
+            execute_hammerhead_turn(vehicle)
+        
+        # Hover for a moment to collect more data
+        print("Collecting final data...")
+        for i in range(10):
+            if not simulation_running:
+                break
+            record_data(vehicle)
+            time.sleep(1)
+        
+        # Return to launch
+        if simulation_running:
+            return_to_launch(vehicle)
+        
+        # Wait for landing
+        print("Waiting for landing...")
+        for i in range(60):  # Wait up to 60 seconds
+            if not simulation_running:
+                break
+            record_data(vehicle)
+            if len(trajectory['altitude']) > 0:
+                current_altitude = trajectory['altitude'][-1]
+                print(f"Altitude: {current_altitude}")
+                if current_altitude < 0.5:
+                    print("Landed!")
+                    break
+            time.sleep(1)
+        
+        # Create visualization
+        visualize_flight_data()
+        
+        print("Simulation complete!")
 
-except Exception as e:
-    print(f"Error occurred: {e}")
-    
-finally:
-    # Close vehicle and SITL simulation
-    print("Closing vehicle connection and simulation...")
-    vehicle.close()
-    sitl.stop()
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        
+    finally:
+        # Clean up
+        global simulation_running
+        simulation_running = False
+        print("Cleaning up...")
+        
+        if sitl_process:
+            print("Terminating SITL process...")
+            sitl_process.terminate()
+            try:
+                sitl_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                sitl_process.kill()
+                
+        print("Done!")
