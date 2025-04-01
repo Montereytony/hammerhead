@@ -106,6 +106,8 @@ def record_data(vehicle):
 
 def arm_and_takeoff(vehicle, target_altitude):
     """Arm the vehicle and fly to target_altitude"""
+    global simulation_running
+    
     print("Basic pre-arm checks")
     
     # Set mode to GUIDED
@@ -123,7 +125,7 @@ def arm_and_takeoff(vehicle, target_altitude):
     
     # Wait for arming
     armed = False
-    while not armed:
+    while not armed and simulation_running:
         msg = vehicle.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
         if msg:
             armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
@@ -198,6 +200,8 @@ def to_quaternion(roll=0.0, pitch=0.0, yaw=0.0):
 
 def execute_hammerhead_turn(vehicle):
     """Execute a hammerhead 180° turn maneuver"""
+    global simulation_running
+    
     print("Starting hammerhead 180° turn...")
     
     # Set initial attitude reference
@@ -208,7 +212,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Step 2: Initial vertical climb with high pitch and full throttle
     print("Initiating vertical climb...")
-    for i in range(20) and simulation_running:  # Run for 2 seconds (20 * 0.1)
+    for i in range(20):  # Run for 2 seconds (20 * 0.1)
+        if not simulation_running:
+            break
         # Set attitude for vertical climb (pitch up 75 degrees)
         send_attitude_target(
             vehicle,
@@ -221,7 +227,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Keep climbing for a few seconds
     print("Continuing vertical climb...")
-    for i in range(40) and simulation_running:  # Run for 4 seconds
+    for i in range(40):  # Run for 4 seconds
+        if not simulation_running:
+            break
         send_attitude_target(
             vehicle,
             roll_angle=0,
@@ -233,7 +241,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Step 3: Cut throttle to initiate stall at top of maneuver
     print("Cutting throttle for stall...")
-    for i in range(20) and simulation_running:  # Run for 2 seconds
+    for i in range(20):  # Run for 2 seconds
+        if not simulation_running:
+            break
         send_attitude_target(
             vehicle,
             roll_angle=0,
@@ -249,7 +259,9 @@ def execute_hammerhead_turn(vehicle):
     if target_yaw > math.pi:
         target_yaw -= 2 * math.pi  # Keep in range -pi to pi
         
-    for i in range(30) and simulation_running:  # Run for 3 seconds
+    for i in range(30):  # Run for 3 seconds
+        if not simulation_running:
+            break
         # Calculate intermediate yaw for smooth rotation
         progress = i / 30.0
         current_yaw = initial_yaw + progress * math.pi
@@ -267,7 +279,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Step 5: Transition to nose down for descent
     print("Transitioning to descent...")
-    for i in range(20) and simulation_running:  # Run for 2 seconds
+    for i in range(20):  # Run for 2 seconds
+        if not simulation_running:
+            break
         progress = i / 20.0
         # Transition from -60 to 60 degrees (nose down)
         current_pitch = math.radians(-60 + progress * 120)
@@ -283,7 +297,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Step 6: Controlled descent in opposite direction
     print("Controlled descent...")
-    for i in range(30) and simulation_running:  # Run for 3 seconds
+    for i in range(30):  # Run for 3 seconds
+        if not simulation_running:
+            break
         send_attitude_target(
             vehicle,
             roll_angle=0,
@@ -295,7 +311,9 @@ def execute_hammerhead_turn(vehicle):
     
     # Step 7: Level out
     print("Leveling out...")
-    for i in range(20) and simulation_running:  # Run for 2 seconds
+    for i in range(20):  # Run for 2 seconds
+        if not simulation_running:
+            break
         progress = i / 20.0
         # Transition from 45 to 0 degrees (level)
         current_pitch = math.radians(45 - progress * 45)
@@ -460,7 +478,6 @@ if __name__ == "__main__":
         
     finally:
         # Clean up
-        global simulation_running
         simulation_running = False
         print("Cleaning up...")
         
